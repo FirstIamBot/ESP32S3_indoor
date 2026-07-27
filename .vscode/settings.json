@@ -1,0 +1,11 @@
+{
+    "arduino.path": "/home/gena/soft/arduino-1.8.19",
+    "arduino.commandPath": "arduino",
+    "arduino.enableUSBDetection": false,
+    "idf.adapterTargetName": "esp32",
+    "idf.openOcdConfigs": [
+        "interface/ftdi/esp32_devkitj_v1.cfg",
+        "target/esp32.cfg"
+    ],
+    "idf.currentSetup": "/home/gena/esp/esp-idf-v5.4"
+}

@@ -1,0 +1,5 @@
+build/
+.pio/build/
+.git/
+.build/
+.vscode/
