@@ -46,6 +46,7 @@ S6 - STR_IO0(COU12) - IO4
 #define S3 GPIO_NUM_35
 #define S4 GPIO_NUM_36
 #define S6 GPIO_NUM_4
+#define TOUCH_PANEL GPIO_SEL_13
 #define SCREEN_WIDTH   EPD_WIDTH
 #define SCREEN_HEIGHT  EPD_HEIGHT
 
@@ -127,7 +128,7 @@ struct touchArea
 touchArea leftTouch;
 touchArea rihgtTouch;
 
-uint8_t page = 2;
+static uint8_t page = 2;
 uint8_t currentPage = 0;
 
 #define TOUCH_INT   13
@@ -214,35 +215,65 @@ bool InitialiseSensors() {
   return (sht31_ok || bmp_ok);
 }
 
+void ForecastWeather(){
+
+ if (StartWiFi() == WL_CONNECTED && SetupTime() == true) {
+    bool WakeUp = false;                
+    if (WakeupHour > SleepHour)
+      WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour); 
+    else                             
+      WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);                              
+    if (WakeUp) {
+      byte Attempts = 1;
+      bool RxWeather  = false;
+      bool RxForecast = false;
+      WiFiClient client;   // wifi client object
+      while ((RxWeather == false || RxForecast == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
+        if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
+        if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
+        Attempts++;
+      }
+    }
+  } else{ 
+    // Читаем данные с локальных датчиков
+    ReadLocalSensors();         
+    // Читаем данные с ESP-NOW датчиков
+    // ReadNOW();
+  }
+
+}
 // Чтение данных с датчиков
-void ReadLocalSensors() {
-  if (!sensors_available) return;
-  
+bool ReadLocalSensors() {
+  if (!sensors_available) 
+    return false;
+ /* 
   // Чтение SHT31
   float temp_sht = sht31.readTemperature();
   float hum = sht31.readHumidity();
-  
+  //if(!sht31.readBoth( &local_temperature, &local_humidity)){
+  //  return false;
+  //}
+
   if (!isnan(temp_sht) && !isnan(hum)) {
     local_temperature = temp_sht;
     local_humidity = hum;
     Serial.printf("SHT31: Temperature = %.2f°C, Humidity = %.2f%%\n", temp_sht, hum);
   }
-  
+  */
   // Чтение BMP085
   float temp_bmp = bmp.readTemperature();
   float press = bmp.readPressure() / 100.0F; // Конвертация Па в гПа (hPa)
   
-  if (!isnan(temp_bmp) && press > 0) {
-    // Если SHT31 не доступен, используем температуру с BMP085
-    if (isnan(local_temperature) || local_temperature == 0.0) {
-      local_temperature = temp_bmp;
-    }
-    local_pressure = press;
-    Serial.printf("BMP085: Temperature = %.2f°C, Pressure = %.2f hPa\n", temp_bmp, press);
-  }
-  
+  local_temperature = temp_bmp;
+  local_pressure = press;
+
   Serial.printf("Local data: T=%.2f°C, H=%.2f%%, P=%.2f hPa\n", 
                 local_temperature, local_humidity, local_pressure);
+                
+  if(isnan(local_temperature) && isnan(local_pressure)){
+    return false;
+  }
+  return true;
 }
 
 void InitialiseSystem() {
@@ -264,54 +295,34 @@ void InitialiseSystem() {
     Serial.println("Warning: No local sensors found");
   }
   //If you were to use ext1, you would use it like
-  esp_sleep_enable_ext0_wakeup(S2, ESP_EXT1_WAKEUP_ALL_LOW);
+  esp_sleep_enable_ext0_wakeup(S2, ESP_EXT1_WAKEUP_ALL_LOW); // Пробуждение от нажатия кнопки S2
+  esp_sleep_enable_ext1_wakeup(TOUCH_PANEL, ESP_EXT1_WAKEUP_ANY_HIGH); // Пробуждение от касания Сенсорной панели
   
-}
-
-void loop() {
-  // Nothing to do here
 }
 
 void setup() {
 
   InitialiseSystem();
-  if (StartWiFi() == WL_CONNECTED && SetupTime() == true) {
-    bool WakeUp = false;                
-    if (WakeupHour > SleepHour)
-      WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour); 
-    else                             
-      WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);                              
-    if (WakeUp) {
-      byte Attempts = 1;
-      bool RxWeather  = false;
-      bool RxForecast = false;
-      WiFiClient client;   // wifi client object
-      while ((RxWeather == false || RxForecast == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
-        if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
-        if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
-        Attempts++;
-      }
-      Serial.println("Received all weather data...");
-      if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
-        // Читаем данные с локальных датчиков
-        ReadLocalSensors();
-        
-        StopWiFi();         // Reduces power consumption
-        epd_poweron();      // Switch on EPD display
-        epd_clear();        // Clear the screen
-        //DisplayWeather();   // Display the weather data
-
-        DisplayLocalWeather();
-
-        edp_update();       // Update the display to show the information
-        epd_poweroff_all(); // Switch off all power to EPD
-      }
-    }
-  }
-  BeginSleep();
+  ForecastWeather();
+  
 }
+unsigned long previousMillis = 0;
+const unsigned long interval = 300000; // 5 минут в миллисекундах (5 * 60 * 1000)
 
+void loop() {
 
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis; // сброс таймера
+    // Код, который выполнится через 5 минут
+    BeginSleep();
+  }
+  DisplayPage();
+  // Nothing to do here
+
+  
+}
 
 void Convert_Readings_to_Imperial() { // Only the first 3-hours are used
   WxConditions[0].Pressure = hPa_to_inHg(WxConditions[0].Pressure);
@@ -480,7 +491,15 @@ double NormalizedMoonPhase(int d, int m, int y) {
   double Phase = (j + 4.867) / 29.53059;
   return (Phase - (int) Phase);
 }
-
+/**
+ * @brief Displays the current weather information on the e-paper display.
+ *
+ * This function is responsible for rendering the main content of the display,
+ * including the status section, general info section, wind section, astronomy
+ * section, main weather section, and forecast section.
+ *
+ * @note The display resolution is 960x540 pixels.
+ */
 void DisplayWeather() {                          // 4.7" e-paper display is 960x540 resolution
   DisplayStatusSection(600, 20, wifi_signal);    // Wi-Fi signal strength and Battery voltage
   DisplayGeneralInfoSection();                   // Top line of the display
@@ -1245,8 +1264,10 @@ void edp_update() {
 }
 
 void DisplayLocalWeather() {
+  
   int x = 40;
   int y = 90;
+
   DisplayStatusSection(600, 20, wifi_signal);    // Wi-Fi signal strength and Battery voltage
   DisplayGeneralInfoSection();                   // Top line of the display
   // Линия между Внешними и Внутреними датчиками
@@ -1284,27 +1305,51 @@ void DisplayPage(){
   rihgtTouch.y1 = 40;
   rihgtTouch.y2 = 500;
 
-  if (digitalRead(TOUCH_INT)) {
+  epd_poweron();          // Switch on EPD display
+
+  if (digitalRead(TOUCH_INT)) { // ???????????????????????????????????
     if (touch.scanPoint()) {
+      epd_clear();            // Clear the screen      
       touch.getPoint(x, y, 0);
+      Serial.printf("X:%d Y:%d\n", x, y);
       y = EPD_HEIGHT - y;
       if ((x > leftTouch.x1 && x < leftTouch.x2) && (y > leftTouch.y1  && y < leftTouch.y2)) {
-        page--;
+        currentPage--;
+        if(currentPage < 0) {
+          currentPage = page;
+        }
       } else if ((x > rihgtTouch.x1 && x < rihgtTouch.x2) && (y > rihgtTouch.y1 && y < rihgtTouch.y2)) {
-        page++;
+        currentPage++;
+        if(currentPage >= page) { 
+          currentPage = 0;
+        }
       } else {
         return;
       }
-      currentPage %= page;
 
-      epd_poweron();       
-      epd_poweroff();
+      switch (currentPage) {
+        case 0:
+          DisplayWeather();
+          break;
+        case 1:
+          DisplayLocalWeather();
+          break;
+        case 2:
+          delay(1000);
+          /*  After calling sleep, you cannot use touch to wake up, you must call wakeup to wake up  */
+          //touch.sleep();
+          break;
+        default:
+          break;
+      }
 
-      while (digitalRead(TOUCH_INT)) {
-        }
-      while (digitalRead(TOUCH_INT)) {
-        }
+      while (digitalRead(TOUCH_INT)) {       }
+      while (digitalRead(TOUCH_INT)) {       }
+
+      edp_update();           // Update the display to show the information
+      epd_poweroff_all();     // Switch off all power to EPD    
     }
+
   }
 
 }

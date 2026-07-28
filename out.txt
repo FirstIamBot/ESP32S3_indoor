@@ -1,0 +1,22 @@
+      Serial.println("Received all weather data...");
+      // Вывод погоды и прогноза если были полученны данные из интернета
+      if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
+        ReadLocalSensors();     // Читаем данные с локальных датчиков
+        epd_poweron();          // Switch on EPD display
+        epd_clear();            // Clear the screen
+        StopWiFi();             // Reduces power consumption
+
+        //DisplayWeather();     // Display the weather internet data
+        DisplayLocalWeather(); // Display the weather local data
+        edp_update();           // Update the display to show the information
+        epd_poweroff_all();     // Switch off all power to EPD
+      }
+
+    if (!isnan(temp_bmp) && press > 0) {
+    // Если SHT31 не доступен, используем температуру с BMP085
+    if (isnan(local_temperature) || local_temperature == 0.0) {
+      local_temperature = temp_bmp;
+    }
+    local_pressure = press;
+    Serial.printf("BMP085: Temperature = %.2f°C, Pressure = %.2f hPa\n", temp_bmp, press);
+  }
