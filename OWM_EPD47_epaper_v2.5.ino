@@ -17,10 +17,21 @@
 #include <WiFi.h>               // In-built
 #include <SPI.h>                // In-built
 #include <time.h>               // In-built
-#include "ESPNowW.h"
+#include <esp_now.h>
+#include <esp_wifi.h>   // esp_wifi_set_channel() / нужен для диагностики канала ESP-NOW
+
+// -----------------------------------------------------------------------
+// ESP-NOW работает только когда обе стороны на ОДНОМ Wi-Fi канале.
+// У дисплея канал определяется домашним роутером (через WiFiManager), поэтому
+// принудительно менять его здесь НЕЛЬЗЯ - это оборвёт подключение к роутеру.
+// Вместо этого: зафиксируйте канал вашего роутера вручную в его настройках
+// (отключите auto-channel) и укажите то же число здесь и в прошивке узла-
+// датчика (см. ESPNOW_WIFI_CHANNEL в его main.cpp) - там канал форсируется,
+// т.к. sender ни к какому роутеру не подключается.
+#define ESPNOW_WIFI_CHANNEL 1
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
 #include <Wire.h>               // In-built
-#include <Adafruit_SHT31.h>     // https://github.com/adafruit/Adafruit_SHT31
+#include "SHTSensor.h"
 #include <Adafruit_BMP085.h>    // https://github.com/adafruit/Adafruit-BMP085-Library
 
 #include "owm_credentials.h"
@@ -66,8 +77,8 @@ enum alignment {LEFT, RIGHT, CENTER};
 WiFiManager wm;
 
 // Датчики температуры, влажности и давления
-Adafruit_SHT31 sht31 = Adafruit_SHT31();
 Adafruit_BMP085 bmp;
+SHTSensor sht;
 
 // Локальные данные с датчиков
 float local_temperature = 0.0;
@@ -79,13 +90,81 @@ bool sensors_available = false;
 float extendet_temperature = 0.0;
 float extendet_humidity = 0.0;
 float extendet_pressure = 0.0;
+uint16_t extendet_lightRaw = 0;     // Значение освещенности (ADC)
+float extendet_batteryVoltage = 0;  // Напряжение питания
 
+// -----------------------------------------------------------------------
+// ESP-NOW: структура сообщения ДОЛЖНА ДОСЛОВНО СОВПАДАТЬ (имя полей, типы,
+// порядок) с той, что использует внешний узел-передатчик (BME280/ESP32-S3,
+// см. espnow_sensor_msg_t в main.cpp узла-датчика).
+// -----------------------------------------------------------------------
+typedef struct __attribute__((packed)) {
+  float temperature;
+  float humidity;
+  float pressure;
+  uint16_t lightRaw; // Значение освещенности (ADC)
+  float batteryVoltage; // Напряжение питания
+} espnow_sensor_msg_t;
+
+espnow_sensor_msg_t   lastEspNowMsg;
+volatile bool         espNowDataReceived = false;
+volatile unsigned long espNowLastRxMillis = 0;
+
+// Колбэк приёма ESP-NOW пакета. Вызывается WiFi-драйвером АСИНХРОННО, в фоне -
+// независимо от того, чем занят основной поток (HTTP-запрос, чтение датчиков,
+// delay() и т.п.). Именно поэтому источники данных не блокируют друг друга.
+//
+// NOTE: сигнатура колбэка esp_now_recv_cb_t зависит от версии arduino-esp32:
+//  - core 2.x / ESP-IDF 4.x (используется здесь): void(*)(const uint8_t*, const uint8_t*, int)
+//  - core 3.x / ESP-IDF 5.x: void(*)(const esp_now_recv_info_t*, const uint8_t*, int)
+// Если при сборке компилятор ругается на несовпадение типов колбэка -
+// значит используется новое ядро, и сигнатуру нужно поменять на вариант с
+// esp_now_recv_info_t (в нём MAC отправителя находится в info->src_addr).
+void OnEspNowRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
+  if (data_len == sizeof(espnow_sensor_msg_t)) {
+    memcpy((void*)&lastEspNowMsg, data, sizeof(lastEspNowMsg));
+    espNowDataReceived = true;
+    espNowLastRxMillis = millis();
+  } else {
+    Serial.printf("ESP-NOW: unexpected payload size %d (expected %d)\n",
+                  data_len, (int)sizeof(espnow_sensor_msg_t));
+  }
+}
+
+// Запускается ОДИН РАЗ, максимально рано (сразу после перевода WiFi в STA),
+// чтобы слушать эфир в фоне на всём протяжении setup() - параллельно с
+// подключением к роутеру, HTTP-запросом к OWM и чтением локальных датчиков.
+bool StartEspNowListener() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW: init failed");
+    return false;
+  }
+  esp_now_register_recv_cb(OnEspNowRecv);
+  Serial.println("ESP-NOW: listening for sensor data in background...");
+  return true;
+}
+
+// Забирает то, что успело накопиться в фоне к моменту вызова - БЕЗ ожидания.
+// Вызывать непосредственно перед рендером экрана.
+bool GetEspNowData() {
+  if (espNowDataReceived) {
+    extendet_temperature    = lastEspNowMsg.temperature;
+    extendet_humidity       = lastEspNowMsg.humidity;
+    extendet_pressure       = lastEspNowMsg.pressure;
+    extendet_batteryVoltage = lastEspNowMsg.batteryVoltage;
+    extendet_lightRaw       = lastEspNowMsg.lightRaw;
+    Serial.printf("ESP-NOW data: T=%.1f°C H=%.1f%% P=%.1fhPa Bat=%dV Light=%d (%lus назад)\n",
+                  extendet_temperature, extendet_humidity, extendet_pressure, extendet_batteryVoltage, extendet_lightRaw,
+                  (millis() - espNowLastRxMillis) / 1000);
+    return true;
+  }
+  Serial.println("ESP-NOW: за этот цикл данных не поступало");
+  return false;
+}
 
 //################  VERSION  ##################################################
 String version = "2.5 / 4.7in";  // Programme version, see change log at end
 //################ VARIABLES ##################################################
-
-
 
 boolean LargeIcon   = true;
 boolean SmallIcon   = false;
@@ -178,8 +257,18 @@ uint8_t StartWiFi() {
   Serial.println("WiFi connected!");
   Serial.println("SSID: " + WiFi.SSID());
   Serial.println("IP: " + WiFi.localIP().toString());
-
   Serial.println("MAC adress: " + WiFi.macAddress());
+
+  // Диагностика канала для ESP-NOW: если не совпадает с ESPNOW_WIFI_CHANNEL,
+  // пакеты от узла-датчика доходить не будут, пока не поменяете канал роутера
+  // (в настройках роутера) или значение ESPNOW_WIFI_CHANNEL здесь и на sender'е.
+  uint8_t actualChannel = WiFi.channel();
+  Serial.printf("WiFi channel: %d (ESPNOW_WIFI_CHANNEL = %d)\n", actualChannel, ESPNOW_WIFI_CHANNEL);
+  if (actualChannel != ESPNOW_WIFI_CHANNEL) {
+    Serial.println("WARNING: router channel != ESPNOW_WIFI_CHANNEL - "
+                    "ESP-NOW от узла-датчика может не приниматься! "
+                    "Зафиксируйте канал роутера или поправьте ESPNOW_WIFI_CHANNEL.");
+  }
 
   return WiFi.status();
 }
@@ -196,14 +285,6 @@ bool InitialiseSensors() {
   bool sht31_ok = false;
   bool bmp_ok = false;
   
-  // Инициализация SHT21/SHT31 (совместимые протоколы)
-  if (sht31.begin(0x40)) {  // Адрес по умолчанию 0x44
-    Serial.println("SHT31 sensor found!");
-    sht31_ok = true;
-  } else {
-    Serial.println("Could not find SHT31 sensor!");
-  }
-  
   // Инициализация BMP085
   if (bmp.begin()) {
     Serial.println("BMP085 sensor found!");
@@ -212,65 +293,39 @@ bool InitialiseSensors() {
     Serial.println("Could not find BMP085 sensor!");
   }
   
-  return (sht31_ok || bmp_ok);
-}
-
-void ForecastWeather(){
-
- if (StartWiFi() == WL_CONNECTED && SetupTime() == true) {
-    bool WakeUp = false;                
-    if (WakeupHour > SleepHour)
-      WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour); 
-    else                             
-      WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);                              
-    if (WakeUp) {
-      byte Attempts = 1;
-      bool RxWeather  = false;
-      bool RxForecast = false;
-      WiFiClient client;   // wifi client object
-      while ((RxWeather == false || RxForecast == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
-        if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
-        if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
-        Attempts++;
-      }
-    }
-  } else{ 
-    // Читаем данные с локальных датчиков
-    ReadLocalSensors();         
-    // Читаем данные с ESP-NOW датчиков
-    // ReadNOW();
+  if (sht.init()) {
+    Serial.println("SHT21 sensor initialization successful.");
+  } else {
+    Serial.println("SHT21 sensor initialization failed!");
   }
-
+  return (bmp_ok);
 }
+
 // Чтение данных с датчиков
 bool ReadLocalSensors() {
-  if (!sensors_available) 
-    return false;
- /* 
-  // Чтение SHT31
-  float temp_sht = sht31.readTemperature();
-  float hum = sht31.readHumidity();
-  //if(!sht31.readBoth( &local_temperature, &local_humidity)){
-  //  return false;
-  //}
 
-  if (!isnan(temp_sht) && !isnan(hum)) {
-    local_temperature = temp_sht;
-    local_humidity = hum;
-    Serial.printf("SHT31: Temperature = %.2f°C, Humidity = %.2f%%\n", temp_sht, hum);
+  float sht21_temp;
+  float sht21_hymidity;
+  // Чтение SHT21
+  if (sht.readSample()) {
+    sht21_temp = sht.getTemperature();
+    sht21_hymidity = sht.getHumidity();
+  } else {
+    Serial.println("Error reading sensor data");
   }
-  */
+
   // Чтение BMP085
   float temp_bmp = bmp.readTemperature();
   float press = bmp.readPressure() / 100.0F; // Конвертация Па в гПа (hPa)
   
-  local_temperature = temp_bmp;
+  local_temperature = (temp_bmp + sht21_temp) * 0.5; // Возможна ошибка если выйдет со строя один из датчиков
   local_pressure = press;
+  local_humidity = sht21_hymidity;
 
   Serial.printf("Local data: T=%.2f°C, H=%.2f%%, P=%.2f hPa\n", 
                 local_temperature, local_humidity, local_pressure);
                 
-  if(isnan(local_temperature) && isnan(local_pressure)){
+  if(isnan(local_temperature) && isnan(local_pressure) && isnan(local_humidity)){
     return false;
   }
   return true;
@@ -294,34 +349,92 @@ void InitialiseSystem() {
   } else {
     Serial.println("Warning: No local sensors found");
   }
+  if (!touch.begin()) {
+    Serial.println("start touchscreen failed");
+    while (1);
+  }
   //If you were to use ext1, you would use it like
   esp_sleep_enable_ext0_wakeup(S2, ESP_EXT1_WAKEUP_ALL_LOW); // Пробуждение от нажатия кнопки S2
   esp_sleep_enable_ext1_wakeup(TOUCH_PANEL, ESP_EXT1_WAKEUP_ANY_HIGH); // Пробуждение от касания Сенсорной панели
   
 }
 
-void setup() {
-
-  InitialiseSystem();
-  ForecastWeather();
-  
+// Проверка, находимся ли мы сейчас в "бодрствующем" интервале (между WakeupHour и SleepHour)
+bool IsWakeTime() {
+  if (WakeupHour > SleepHour)
+    return (CurrentHour >= WakeupHour || CurrentHour <= SleepHour);
+  return (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);
 }
+
+// Получение данных с OpenWeatherMap, вывод на экран
+void FetchAndShowOnlineWeather() {
+  byte Attempts = 1;
+  bool RxWeather  = false;
+  bool RxForecast = false;
+  WiFiClient client;   // wifi client object
+  while ((!RxWeather || !RxForecast) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
+    if (!RxWeather)  RxWeather  = obtainWeatherData(client, "weather");
+    if (!RxForecast) RxForecast = obtainWeatherData(client, "forecast");
+    Attempts++;
+  }
+  Serial.println("Received all weather data...");
+
+  if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
+    StopWiFi();         // Reduces power consumption (это же отключает приём ESP-NOW)
+    epd_poweron();      // Switch on EPD display
+    epd_clear();        // Clear the screen
+    DisplayWeather();   // Display the weather data
+    edp_update();       // Update the display to show the information
+    epd_poweroff_all(); // Switch off all power to EPD
+  }
+}
+
+void setup() {
+  InitialiseSystem();
+
+  // WiFi переводим в STA-режим и сразу запускаем ESP-NOW листенер -
+  // максимально рано, до подключения к роутеру и HTTP-запроса к OWM.
+  // С этого момента пакеты от внешнего датчика будут копиться в фоне,
+  // не блокируя ни WiFiManager, ни чтение локальных датчиков, ни OWM.
+  WiFi.mode(WIFI_STA);
+  StartEspNowListener();
+
+  bool wifiOK = (StartWiFi() == WL_CONNECTED && SetupTime());
+
+  ReadLocalSensors(); // локальные датчики - независимо от результата WiFi
+
+  if (!wifiOK) {
+    // WiFi недоступен (нет сети или истёк таймаут портала настройки) -
+    // показываем то, что успели прочитать локально и получить по ESP-NOW
+    Serial.println("No WiFi - reading local sensors only");
+    GetEspNowData();
+    epd_poweron();
+    epd_clear();
+    DisplayLocalWeather();
+    edp_update();
+    epd_poweroff_all();
+    return;
+  }
+
+  if (IsWakeTime()) {
+    FetchAndShowOnlineWeather(); // пока идёт HTTP - ESP-NOW слушает параллельно
+  }
+
+  GetEspNowData(); // забираем то, что накопилось к этому моменту, без ожидания
+}
+
 unsigned long previousMillis = 0;
-const unsigned long interval = 300000; // 5 минут в миллисекундах (5 * 60 * 1000)
 
 void loop() {
-
   unsigned long currentMillis = millis();
-  
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis; // сброс таймера
-    // Код, который выполнится через 5 минут
+
+  if (currentMillis - previousMillis >= 300000) { // 5 минут = 300000 мс
+    previousMillis = currentMillis;
+    Serial.println("Time to check weather data...");
     BeginSleep();
   }
   DisplayPage();
-  // Nothing to do here
-
-  
+  // ... rest of code ...
 }
 
 void Convert_Readings_to_Imperial() { // Only the first 3-hours are used
@@ -1264,10 +1377,8 @@ void edp_update() {
 }
 
 void DisplayLocalWeather() {
-  
   int x = 40;
   int y = 90;
-
   DisplayStatusSection(600, 20, wifi_signal);    // Wi-Fi signal strength and Battery voltage
   DisplayGeneralInfoSection();                   // Top line of the display
   // Линия между Внешними и Внутреними датчиками
@@ -1279,16 +1390,18 @@ void DisplayLocalWeather() {
 
   setFont(OpenSans18B);
   drawString(x + 10, y + 150, "Temperature: " + String(extendet_temperature, 0) + " C", LEFT); 
-  drawString(x + 10, y + 210, "Humidity: " + String(extendet_humidity, 0) + " %", LEFT); 
+  drawString(x + 10, y + 210, "Humidity: " + String(extendet_humidity, 1) + " %", LEFT); 
   drawString(x + 10, y + 285, "Pressure: " + String(extendet_pressure, 1) + " mm", LEFT);
-
+  drawString(x + 10, y + 345, "Batery: " + String(extendet_batteryVoltage, 1) + " %", LEFT); 
+  drawString(x + 10, y + 405, "Ligth: " + String(extendet_lightRaw, 1), LEFT);
+  
   // Вывод данных Внeутрених датчиков
   setFont(OpenSans24B);
   drawString( x + 660, y + 10, "INDOOR", CENTER);   // НАзвание датчиков "ВНутрений"
   
   setFont(OpenSans18B);
-  drawString( x + 500, y + 150, "Temperature: " + String(local_temperature, 0) + " C", LEFT); 
-  drawString( x + 500, y + 210, "Humidity: " + String(local_humidity, 0) + " %", LEFT); 
+  drawString( x + 500, y + 150, "Temperature: " + String(local_temperature, 1) + " C", LEFT); 
+  drawString( x + 500, y + 210, "Humidity: " + String(local_humidity, 1) + " %", LEFT); 
   drawString( x + 500, y + 285, "Pressure: " + String(local_pressure, 1) + " mm", LEFT); 
 
 }
@@ -1296,60 +1409,51 @@ void DisplayLocalWeather() {
 void DisplayPage(){
   uint16_t  x, y;
   leftTouch.x1 = 5;
-  leftTouch.x2 = 100;
+  leftTouch.x2 = 250;
   leftTouch.y1 = 40;
   leftTouch.y2 = 500;
 
-  rihgtTouch.x1 = 860;
+  rihgtTouch.x1 = 660;
   rihgtTouch.x2 = 960;
   rihgtTouch.y1 = 40;
   rihgtTouch.y2 = 500;
-
-  epd_poweron();          // Switch on EPD display
-
+ 
   if (digitalRead(TOUCH_INT)) { // ???????????????????????????????????
-    if (touch.scanPoint()) {
-      epd_clear();            // Clear the screen      
+    
+    if(touch.scanPoint()) {
       touch.getPoint(x, y, 0);
       Serial.printf("X:%d Y:%d\n", x, y);
       y = EPD_HEIGHT - y;
       if ((x > leftTouch.x1 && x < leftTouch.x2) && (y > leftTouch.y1  && y < leftTouch.y2)) {
         currentPage--;
-        if(currentPage < 0) {
-          currentPage = page;
-        }
       } else if ((x > rihgtTouch.x1 && x < rihgtTouch.x2) && (y > rihgtTouch.y1 && y < rihgtTouch.y2)) {
         currentPage++;
-        if(currentPage >= page) { 
-          currentPage = 0;
-        }
       } else {
         return;
       }
+      currentPage %= page;
+      Serial.printf("currentPageX:%d\n", currentPage);
 
-      switch (currentPage) {
-        case 0:
-          DisplayWeather();
-          break;
-        case 1:
-          DisplayLocalWeather();
-          break;
-        case 2:
-          delay(1000);
-          /*  After calling sleep, you cannot use touch to wake up, you must call wakeup to wake up  */
-          //touch.sleep();
-          break;
-        default:
-          break;
+      if(currentPage == 0){
+          epd_poweron();      // Switch on EPD display
+          epd_clear();        // Clear the screen
+          memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+          DisplayWeather();   // Display the weather data
+          edp_update();       // Update the display to show the information
+          epd_poweroff_all(); // Switch off all power to EPD
       }
-
+      if(currentPage == 1){
+          epd_poweron();      // Switch on EPD display
+          memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+          epd_clear();        // Clear the screen
+          DisplayLocalWeather();
+          edp_update();       // Update the display to show the information
+          epd_poweroff_all(); // Switch off all power to EPD
+      }
       while (digitalRead(TOUCH_INT)) {       }
       while (digitalRead(TOUCH_INT)) {       }
-
-      edp_update();           // Update the display to show the information
-      epd_poweroff_all();     // Switch off all power to EPD    
     }
-
+    
   }
 
 }
