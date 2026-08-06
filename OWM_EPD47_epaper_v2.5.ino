@@ -160,7 +160,7 @@ String  Time_str = "--:--:--";  /**< Строка форматированног
 String  Date_str = "-- --- ----"; /**< Строка форматированной даты. */
 int     wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0, vref = 1100;
 
-Forecast_record_type  WxConditions[1];            /**< Данные о текущей погоде. */
+RTC_DATA_ATTR Forecast_record_type  WxConditions[1];  /**< Данные о текущей погоде - переживає Deep Sleep для швидкого редраву за дотиком. */
 Forecast_record_type  WxForecast[max_readings];   /**< Данные о прогнозе погоды. */
 
 float pressure_readings[max_readings]    = {0};   /**< Массив графика давления. */
@@ -186,20 +186,23 @@ SHTSensor sht;                /**< Объект датчика влажност�
 TouchClass touch;             /**< Объект сенсорной панели. */
 
 // Sensor Data (Local)
-float local_temperature = 0.0;  /**< Локальная температура с датчиков. */
-float local_humidity = 0.0;     /**< Локальная влажность с датчиков. */
-float local_pressure = 0.0;     /**< Локальное давление с датчиков. */
+// RTC_DATA_ATTR - ці змінні переживають Deep Sleep (лишаються в RTC-пам'яті
+// через перезавантаження), тому швидкий редрав "за дотиком" (без WiFi/OWM/
+// ESP-NOW) може використати останні відомі значення одразу після пробудження.
+RTC_DATA_ATTR float local_temperature = 0.0;  /**< Локальная температура с датчиков. */
+RTC_DATA_ATTR float local_humidity = 0.0;     /**< Локальная влажность с датчиков. */
+RTC_DATA_ATTR float local_pressure = 0.0;     /**< Локальное давление с датчиков. */
 bool sensors_available = false; /**< Флаг доступности встроенных датчиков. */
 
 // Sensor Data (External ESP-NOW)
-float extendet_temperature = 0.0;     /**< Внешняя температура по ESP-NOW. */
-float extendet_humidity = 0.0;        /**< Внешняя влажность по ESP-NOW. */
-float extendet_pressure = 0.0;        /**< Внешнее давление по ESP-NOW. */
-float extendet_batteryVoltage = 0;    /**< Напряжение батареи внешнего датчика. */
-uint8_t extendet_battery_percent;     /**< Процент заряда батареи внешнего датчика. */
-float extendet_g_solar_voltage;       /**< Напряжение солнечной панели внешнего датчика. */
-uint8_t extendet_solar_percent = 0;   /**< Эффективность солнечной панели внешнего датчика. */
-int64_t extendet_timestamp;           /**< Timestamp получения внешних данных. */
+RTC_DATA_ATTR float extendet_temperature = 0.0;     /**< Внешняя температура по ESP-NOW. */
+RTC_DATA_ATTR float extendet_humidity = 0.0;        /**< Внешняя влажность по ESP-NOW. */
+RTC_DATA_ATTR float extendet_pressure = 0.0;        /**< Внешнее давление по ESP-NOW. */
+RTC_DATA_ATTR float extendet_batteryVoltage = 0;    /**< Напряжение батареи внешнего датчика. */
+RTC_DATA_ATTR uint8_t extendet_battery_percent;     /**< Процент заряда батареи внешнего датчика. */
+RTC_DATA_ATTR float extendet_g_solar_voltage;       /**< Напряжение солнечной панели внешнего датчика. */
+RTC_DATA_ATTR uint8_t extendet_solar_percent = 0;   /**< Эффективность солнечной панели внешнего датчика. */
+RTC_DATA_ATTR int64_t extendet_timestamp;           /**< Timestamp получения внешних данных. */
 
 espnow_sensor_msg_t   lastEspNowMsg;       /**< Последний полученный пакет ESP-NOW. */
 uint8_t               lastSenderMac[6] = {0}; /**< MAC-адрес последнего отправителя. */
@@ -217,7 +220,7 @@ touchArea leftTouch;   /**< Левая сенсорная зона перекл�
 touchArea rihgtTouch;  /**< Правая сенсорная зона переключения страниц. */
 
 static uint8_t page = 2;       /**< Общее количество доступных страниц. */
-uint8_t currentPage = 0;       /**< Индекс активной страницы. */
+RTC_DATA_ATTR uint8_t currentPage = 0;       /**< Індекс активної сторінки - переживає Deep Sleep. */
 
 static bool cycleDataHandled = false; /**< Флаг обработки цикла данных ESP-NOW. */
 
@@ -323,6 +326,10 @@ void DisplayPage();
  */
 void setup() {
   InitialiseSystem();
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+    QuickTouchWake(); // не повертається - одразу йде назад у Deep Sleep
+  }
 
   WiFi.mode(WIFI_STA);
   StartEspNowListener();
@@ -866,10 +873,44 @@ void InitialiseSystem() {
     while (1);
   }
 
-  //esp_sleep_enable_ext0_wakeup(S2, ESP_EXT1_WAKEUP_ALL_LOW); 
-  // esp_sleep_enable_ext1_wakeup(TOUCH_PANEL, ...) навмисно НЕ реєструється -
-  // дотик не повинен достроково розбуджувати пристрій із Deep Sleep і
-  // порушувати рівний 30-хвилинний розклад пробудження.
+  // Пробудження від дотику дозволене знову - тепер обробляється швидким
+  // шляхом (QuickTouchWake(), без WiFi/OWM/ESP-NOW), який одразу повертає
+  // пристрій у сон на РЕШТУ розрахованого часу - розклад не порушується.
+  esp_sleep_enable_ext1_wakeup(TOUCH_PANEL, ESP_EXT1_WAKEUP_ANY_HIGH);
+}
+
+// Швидке пробудження дотиком: перемикає сторінку і одразу перемальовує
+// екран ОСТАННІМИ збереженими даними (без WiFi/OWM/ESP-NOW - секунди, а не
+// хвилини), після чого негайно повертається в Deep Sleep на решту
+// розрахованого часу до найближчої межі SleepDuration. Час рахується напряму
+// з DS3231 (швидко, без очікування NTP - WiFi тут навіть не піднімається).
+void QuickTouchWake() {
+  currentPage = (currentPage + 1) % page;
+  Serial.printf("Дотик під час сну: перемикаємо на сторінку %d (швидкий редрав)\n", currentPage);
+
+  epd_poweron();
+  epd_clear();
+  memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+  if (currentPage == 0) {
+    DisplayWeather();
+  } else {
+    DisplayLocalWeather();
+  }
+  edp_update();
+  epd_poweroff_all();
+
+  struct tm timeinfo;
+  if (DS3231_GetTime(&timeinfo)) {
+    long secIntoWindow = (long)(timeinfo.tm_min % SleepDuration) * 60L + timeinfo.tm_sec;
+    SleepTimer = SleepDuration * 60 - secIntoWindow;
+    if (SleepTimer <= 0) SleepTimer += SleepDuration * 60;
+  } else {
+    SleepTimer = SleepDuration * 60; // останній запасний варіант, якщо навіть DS3231 недоступний
+  }
+
+  Serial.println("Швидке пробудження: повертаємось у сон на " + String(SleepTimer) + " с");
+  esp_sleep_enable_timer_wakeup((uint64_t)SleepTimer * 1000000ULL);
+  esp_deep_sleep_start();
 }
 
 /**
@@ -1221,17 +1262,22 @@ String WindDegToOrdinalDirection(float winddirection) {
  * @param y Позиция Y.
  */
 void DisplayTemperatureSection(int x, int y) {
-  setFont(OpenSans18B);
-  if (sensors_available && local_temperature > -50) {
-    drawString(x - 30, y, String(local_temperature, 1) + "°    " + String(local_humidity, 0) + "%", LEFT);
-    setFont(OpenSans8B);
-    drawString(x - 30, y - 15, "LOCAL", LEFT);
-    setFont(OpenSans18B);
-  } else {
-    drawString(x - 30, y, String(WxConditions[0].Temperature, 1) + "°    " + String(WxConditions[0].Humidity, 0) + "%", LEFT);
-  }
   setFont(OpenSans12B);
-  drawString(x + 10, y + 35, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", CENTER); 
+  if (sensors_available && local_temperature > -50) {
+    drawString(x - 10, y + 25, String(local_temperature, 1) + "° | " + String(local_humidity, 0) + "%", LEFT);
+    setFont(OpenSans12B);
+    drawString(x - 10, y, "LOCAL (INDOOR)", LEFT);
+  } 
+  setFont(OpenSans12B);
+  drawString(x + 300, y + 38, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", CENTER); 
+
+  // OUTDOOR (ESP-NOW) - показуємо поруч, якщо дані від зовнішнього сенсора вже надходили хоч раз
+  if (extendet_timestamp > 0) {
+    setFont(OpenSans12B);
+    drawString(x - 10, y + 60, "OUTDOOR", LEFT);
+    setFont(OpenSans12B);
+    drawString(x - 10, y + 80, String(extendet_temperature, 1) + "° | "  + String(extendet_humidity, 0) + "%", LEFT);
+  }
 }
 
 /**
@@ -1274,6 +1320,11 @@ void DisplayPressureSection(int x, int y, float pressure, String slope) {
     DrawPressureAndTrend(x - 25, y + 10, local_pressure, slope);
   } else {
     DrawPressureAndTrend(x - 25, y + 10, pressure, slope);
+  }
+  if (extendet_timestamp > 0) {
+    setFont(OpenSans8B);
+    drawString(x - 25, y + 45, "OUTDOOR: " + String(extendet_pressure / 100.0f, 1) + " hPa", LEFT);
+    setFont(OpenSans12B);
   }
   if (WxConditions[0].Visibility > 0) {
     Visibility(x + 145, y, String(WxConditions[0].Visibility) + "M");
