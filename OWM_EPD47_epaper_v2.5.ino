@@ -97,7 +97,10 @@
 
 #define DS3231_ADDR 0x68    /**< @brief I2C адрес часов реального времени DS3231. */
 
-//#define TESTING_DISABLE_DEEP_SLEEP
+// Архітектура сну: Light Sleep (esp_light_sleep_start()) + epd_poweroff_light()
+// (3.3В/PWR_EN лишається увімкненим). Обидва хардкоджені навмисно - Light
+// Sleep зберігає стан змінних між пробудженнями (не потребує "нового
+// циклу" через reboot), а увімкнене 3.3В потрібне для роботи QuickTouchWake().
 
 // =======================================================================
 // 3. ENUMS & STRUCTURES
@@ -322,14 +325,16 @@ void DisplayPage();
 // =======================================================================
 
 /**
- * @brief Функция начальной настройки устройства.
+ * @brief Запускає новий робочий цикл: WiFi, NTP, OWM, локальні датчики,
+ *        перезапуск ESP-NOW-слухача. Викликається з setup() (перший старт)
+ *        і повторно з BeginSleep() одразу після пробудження з Light Sleep -
+ *        оскільки Light Sleep НЕ перезавантажує чіп, setup() вдруге вже не
+ *        викликається, тож весь "новий цикл" треба запускати явно тут.
  */
-void setup() {
-  InitialiseSystem();
-
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
-    QuickTouchWake(); // не повертається - одразу йде назад у Deep Sleep
-  }
+void StartNewCycle() {
+  StartTime = millis();
+  espNowDataReceived = false;
+  cycleDataHandled = false;
 
   WiFi.mode(WIFI_STA);
   StartEspNowListener();
@@ -351,6 +356,14 @@ void setup() {
   }
 
   GetEspNowData(); 
+}
+
+/**
+ * @brief Функция начальной настройки устройства.
+ */
+void setup() {
+  InitialiseSystem();
+  StartNewCycle();
 }
 
 /**
@@ -612,7 +625,7 @@ void SendSyncAck(const uint8_t *mac_addr) {
     }
   }
 
-  const long WAKE_MARGIN_SEC = 90;
+  const long WAKE_MARGIN_SEC = 45; // 
   long secUntilNextWake;
 
   time_t now = time(nullptr);
@@ -637,28 +650,34 @@ void SendSyncAck(const uint8_t *mac_addr) {
 }
 
 /**
- * @brief Переводит микроконтроллер в режим глубокого сна (Deep Sleep).
+ * @brief Переводить мікроконтролер у Light Sleep. Light Sleep НЕ перезавантажує
+ *        чіп (на відміну від Deep Sleep) - RAM/змінні зберігаються, тому
+ *        виконання просто продовжується одразу після esp_light_sleep_start().
+ *        Через це весь "новий цикл" (WiFi/NTP/OWM/ESP-NOW) запускається явно
+ *        через StartNewCycle() тут же, а не через повторний виклик setup().
  */
 void BeginSleep() {
-#ifdef TESTING_DISABLE_DEEP_SLEEP
-  UpdateLocalTime();
-  SleepTimer = (SleepDuration * 60 - ((CurrentMin % SleepDuration) * 60 + CurrentSec)) + Delta;
-  Serial.println("[TEST MODE] Deep Sleep вимкнено - INDOOR лишається активним (WiFi/ESP-NOW не вимикаються)");
-  Serial.println("[TEST MODE] За ззвичайних умов тут був би сон на " + String(SleepTimer) + " (secs)");
-  espNowDataReceived = false;
-  StartTime = millis();
-  return; 
-#endif
   StopWiFi(); 
-  epd_poweroff_all(); // ПОВНЕ вимкнення (включно з 3.3В/PWR_EN) - критично перед Deep Sleep,
-                        // бо 74HCT4094D тримає останній стан весь час сну незалежно від ESP32
+  epd_poweroff_light(); // 3.3В лишається увімкненим - потрібно і для тачскріна, і для коректного Light Sleep
+
   UpdateLocalTime();
   SleepTimer = (SleepDuration * 60 - ((CurrentMin % SleepDuration) * 60 + CurrentSec)) + Delta; 
   esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL); 
   Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
   Serial.println("Entering " + String(SleepTimer) + " (secs) of sleep time");
-  Serial.println("Starting deep-sleep period...");
-  esp_deep_sleep_start();  
+  Serial.println("Starting light-sleep period...");
+  esp_light_sleep_start();
+
+  // ---- Виконання продовжується ТУТ ЖЕ після пробудження ----
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.println("Пробудження дотиком під час Light Sleep");
+    QuickTouchWake(); // швидкий редрав + рекурсивне повернення в сон на решту часу
+    return;
+  }
+
+  Serial.println("Прокинулись з Light Sleep (таймер) - починаємо новий цикл");
+  StartNewCycle();
 }
 
 /**
@@ -884,6 +903,9 @@ void InitialiseSystem() {
 // хвилини), після чого негайно повертається в Deep Sleep на решту
 // розрахованого часу до найближчої межі SleepDuration. Час рахується напряму
 // з DS3231 (швидко, без очікування NTP - WiFi тут навіть не піднімається).
+// Викликається з BeginSleep() одразу після esp_light_sleep_start() -
+// Light Sleep НЕ перезавантажує чіп, тому це просто продовження виконання,
+// а не окремий "боот".
 void QuickTouchWake() {
   currentPage = (currentPage + 1) % page;
   Serial.printf("Дотик під час сну: перемикаємо на сторінку %d (швидкий редрав)\n", currentPage);
@@ -897,7 +919,7 @@ void QuickTouchWake() {
     DisplayLocalWeather();
   }
   edp_update();
-  epd_poweroff_all();
+  epd_poweroff_light(); // 3.3В лишається увімкненим - тачскрін готовий до наступного дотику
 
   struct tm timeinfo;
   if (DS3231_GetTime(&timeinfo)) {
@@ -908,9 +930,19 @@ void QuickTouchWake() {
     SleepTimer = SleepDuration * 60; // останній запасний варіант, якщо навіть DS3231 недоступний
   }
 
-  Serial.println("Швидке пробудження: повертаємось у сон на " + String(SleepTimer) + " с");
+  Serial.println("Швидке пробудження: повертаємось у Light Sleep на " + String(SleepTimer) + " с");
   esp_sleep_enable_timer_wakeup((uint64_t)SleepTimer * 1000000ULL);
-  esp_deep_sleep_start();
+  esp_light_sleep_start();
+
+  // Знову продовження одразу після пробудження - могло бути ще одне
+  // торкання, або спрацював таймер (тоді час запускати новий повний цикл).
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    QuickTouchWake(); // ще один дотик - рекурсивно повторюємо швидкий редрав
+  } else {
+    Serial.println("Прокинулись з Light Sleep (таймер) після дотику - починаємо новий цикл");
+    StartNewCycle();
+  }
 }
 
 /**
@@ -1264,19 +1296,20 @@ String WindDegToOrdinalDirection(float winddirection) {
 void DisplayTemperatureSection(int x, int y) {
   setFont(OpenSans12B);
   if (sensors_available && local_temperature > -50) {
-    drawString(x - 10, y + 25, String(local_temperature, 1) + "° | " + String(local_humidity, 0) + "%", LEFT);
+    drawString(x - 10, y + 25, String(local_temperature, 1) + "° | " + String(local_humidity, 0) + "% | " + String(local_pressure , 0) + " hPa", LEFT);
     setFont(OpenSans12B);
     drawString(x - 10, y, "LOCAL (INDOOR)", LEFT);
   } 
+
   setFont(OpenSans12B);
-  drawString(x + 300, y + 38, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", CENTER); 
+  drawString(x + 330, y + 36, String(WxConditions[0].High, 0) + "° | " + String(WxConditions[0].Low, 0) + "°", CENTER); 
 
   // OUTDOOR (ESP-NOW) - показуємо поруч, якщо дані від зовнішнього сенсора вже надходили хоч раз
   if (extendet_timestamp > 0) {
     setFont(OpenSans12B);
-    drawString(x - 10, y + 60, "OUTDOOR", LEFT);
+    drawString(x - 10, y + 65, "OUTDOOR", LEFT);
     setFont(OpenSans12B);
-    drawString(x - 10, y + 80, String(extendet_temperature, 1) + "° | "  + String(extendet_humidity, 0) + "%", LEFT);
+    drawString(x - 10, y + 85, String(extendet_temperature, 1) + "° | "  + String(extendet_humidity, 0) + "%", LEFT);
   }
 }
 
