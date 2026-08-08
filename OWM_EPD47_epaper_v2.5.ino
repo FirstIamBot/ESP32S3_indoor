@@ -1309,9 +1309,10 @@ void DisplayTemperatureSection(int x, int y) {
     setFont(OpenSans12B);
     drawString(x - 10, y + 65, "OUTDOOR", LEFT);
     setFont(OpenSans12B);
-    drawString(x - 10, y + 85, String(extendet_temperature, 1) + "° | "  + String(extendet_humidity, 0) + "%", LEFT);
+    drawString(x - 10, y + 85, String(extendet_temperature, 1) + "° | "  + String(extendet_humidity, 0) + "% | " + String(extendet_pressure/100.0f , 0) + " hPa", LEFT);
   }
 }
+
 
 /**
  * @brief Отображает текстовую описательную часть прогноза погоды.
@@ -1336,8 +1337,8 @@ void DisplayForecastTextSection(int x, int y) {
   if (WxForecast[0].Rainfall > 0) Wx_Description += " (" + String(WxForecast[0].Rainfall, 1) + String((Units == "M" ? "mm" : "in")) + ")";
   String Line1 = Wx_Description.substring(0, Wx_Description.indexOf("~"));
   String Line2 = Wx_Description.substring(Wx_Description.indexOf("~") + 1);
-  drawString(x + 320, y + 20, TitleCase(Line1), LEFT);
-  if (Line1 != Line2) drawString(x + 320, y + 40, Line2, LEFT);
+  drawString(x + 330, y + 20, TitleCase(Line1), LEFT);
+  if (Line1 != Line2) drawString(x + 330, y + 30, Line2, LEFT);
 }
 
 /**
@@ -1353,11 +1354,6 @@ void DisplayPressureSection(int x, int y, float pressure, String slope) {
     DrawPressureAndTrend(x - 25, y + 10, local_pressure, slope);
   } else {
     DrawPressureAndTrend(x - 25, y + 10, pressure, slope);
-  }
-  if (extendet_timestamp > 0) {
-    setFont(OpenSans8B);
-    drawString(x - 25, y + 45, "OUTDOOR: " + String(extendet_pressure / 100.0f, 1) + " hPa", LEFT);
-    setFont(OpenSans12B);
   }
   if (WxConditions[0].Visibility > 0) {
     Visibility(x + 145, y, String(WxConditions[0].Visibility) + "M");
