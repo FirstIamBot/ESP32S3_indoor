@@ -1336,8 +1336,8 @@ void DisplayForecastTextSection(int x, int y) {
   if (WxForecast[0].Rainfall > 0) Wx_Description += " (" + String(WxForecast[0].Rainfall, 1) + String((Units == "M" ? "mm" : "in")) + ")";
   String Line1 = Wx_Description.substring(0, Wx_Description.indexOf("~"));
   String Line2 = Wx_Description.substring(Wx_Description.indexOf("~") + 1);
-  drawString(x + 30, y + 5, TitleCase(Line1), LEFT);
-  if (Line1 != Line2) drawString(x + 30, y + 30, Line2, LEFT);
+  drawString(x + 320, y + 20, TitleCase(Line1), LEFT);
+  if (Line1 != Line2) drawString(x + 320, y + 40, Line2, LEFT);
 }
 
 /**
